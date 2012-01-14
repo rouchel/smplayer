@@ -1,34 +1,81 @@
-import java.io.ByteArrayInputStream;
 import java.io.DataInputStream;
-import java.io.DataOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.PrintWriter;
-import java.net.MalformedURLException;
 import java.net.Socket;
 import java.net.URL;
 import java.net.UnknownHostException;
-import java.text.Format;
 import java.util.HashMap;
-import java.util.concurrent.Semaphore;
 
-import javax.media.Manager;
-import javax.sound.sampled.AudioFileFormat;
 import javax.sound.sampled.AudioFormat;
 import javax.sound.sampled.AudioSystem;
 import javax.sound.sampled.DataLine;
 import javax.sound.sampled.LineUnavailableException;
 import javax.sound.sampled.SourceDataLine;
-import javax.sound.sampled.UnsupportedAudioFileException;
 
-import org.omg.CORBA.PRIVATE_MEMBER;
+import javazoom.jl.decoder.Bitstream;
+import javazoom.jl.decoder.BitstreamException;
+import javazoom.jl.decoder.DecoderException;
+import javazoom.jl.decoder.Obuffer;
 
-import sun.misc.Lock;
-import sun.print.resources.serviceui;
+class RamObuffer extends Obuffer {
+	private byte[] buffer;
+	private short[] bufferp;
+	private int channels;
+	private Fifo fifo;
 
-import com.sun.corba.se.impl.orbutil.concurrent.Mutex;
-import com.sun.corba.se.spi.ior.Writeable;
-import com.sun.media.parser.audio.WavParser;
+	public RamObuffer(int number_of_channels, int freq, Fifo wFifo) {
+		buffer = new byte[OBUFFERSIZE * 2];
+		bufferp = new short[MAXCHANNELS];
+		channels = number_of_channels;
+		fifo = wFifo;
+
+		for (int i = 0; i < number_of_channels; ++i)
+			bufferp[i] = (short) i;
+	}
+
+	/**
+	 * Takes a 16 Bit PCM sample.
+	 */
+	public void append(int channel, short value) {
+		buffer[bufferp[channel] * 2] = (byte) (value & 0x00FF);
+		buffer[bufferp[channel] * 2 + 1] = (byte) ((value >>> 8) & 0x00FF);
+		bufferp[channel] += channels;
+	}
+
+	/**
+	 * Write the samples to the file (Random Acces).
+	 */
+	short[] myBuffer = new short[2];
+
+	public void write_buffer(int val) {
+		while (-1 == fifo.write(buffer, bufferp[0] * 2)) {
+			try {
+				Thread.sleep(10);
+			} catch (InterruptedException e) {
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			}
+		}
+
+		for (int i = 0; i < channels; ++i)
+			bufferp[i] = (short) i;
+	}
+
+	public void close() {
+	}
+
+	/**
+   *
+   */
+	public void clear_buffer() {
+	}
+
+	/**
+   *
+   */
+	public void set_stop_flag() {
+	}
+}
 
 class Fifo {
 	private byte[] buff;
@@ -36,7 +83,11 @@ class Fifo {
 	private int length;
 	private int used;
 	private int lock;
-	
+	public AudioFormat format;
+
+	// File file = new File("/tmp/xyz.wav");
+	// RandomAccessFile raf;
+
 	private void fifoLock() {
 		while (lock == 1) {
 			try {
@@ -46,10 +97,10 @@ class Fifo {
 				e.printStackTrace();
 			}
 		}
-		
+
 		lock = 1;
 	}
-	
+
 	private void fifoUnlock() {
 		lock = 0;
 	}
@@ -61,32 +112,48 @@ class Fifo {
 		writeIndex = 0;
 		used = 0;
 		lock = 0;
+
+		// try {
+		// raf = new RandomAccessFile(file, "rw");
+		// } catch (FileNotFoundException e) {
+		// // TODO Auto-generated catch block
+		// e.printStackTrace();
+		// }
 	}
 
 	public int write(byte[] inBuff, int size) {
+		//
+		// try {
+		// raf.write(inBuff, 0, size);
+		// } catch (IOException e) {
+		// // TODO Auto-generated catch block
+		// e.printStackTrace();
+		// }
+		//
+		// return 0;
+		//
 		fifoLock();
-		
+
 		if (used + size > length) {
 			fifoUnlock();
 			return -1;
 		}
 
-		byte tmp = buff[0];
 		for (int i = 0; i < size; i++) {
 			buff[writeIndex] = inBuff[i];
 			writeIndex++;
 			writeIndex %= length;
 		}
 		used += size;
-		
+
 		fifoUnlock();
-		
+
 		return size;
 	}
 
 	public int read(byte[] outBuff, int size) {
 		fifoLock();
-		
+
 		if (used < size) {
 			fifoUnlock();
 			return -1;
@@ -98,7 +165,7 @@ class Fifo {
 			readIndex %= length;
 			used--;
 		}
-		
+
 		fifoUnlock();
 
 		return size;
@@ -111,7 +178,7 @@ class Fifo {
 	public boolean isEmpty() {
 		return used == 0;
 	}
-	
+
 	public int getLength() {
 		return length;
 	}
@@ -124,43 +191,52 @@ class HttpFile {
 	private PrintWriter out;
 	private Socket skt;
 	private HashMap<String, String> head;
-	
+
 	class DownloadThread extends Thread {
 		private Fifo fifo;
-		private int size;
-		public DownloadThread (Fifo downFifo, int downSize) {
-			size = downSize;
+
+		public DownloadThread(Fifo downFifo) {
 			fifo = downFifo;
 		}
+
 		@Override
 		public void run() {
 			// TODO Auto-generated method stub
 			super.run();
-			byte[] buff = new byte[1024];
-			int readLen;
-			int count = 0;
-			while (count < size) {
+			Bitstream bitIn = new Bitstream(in);
+			javazoom.jl.decoder.Header header;
+			javazoom.jl.decoder.Decoder decoder = new javazoom.jl.decoder.Decoder();
+			RamObuffer output;
+
+			for (int frame = 0; frame < Integer.MAX_VALUE; frame++) {
 				try {
-					readLen = in.read(buff, 0, buff.length);
-					if (readLen <= 0) {
-						System.err.println("read error");
+					header = bitIn.readFrame();
+					if (header == null)
 						break;
+
+					int channels = (header.mode() == javazoom.jl.decoder.Header.SINGLE_CHANNEL) ? 1
+							: 2;
+					int freq = header.frequency();
+					if (fifo.format == null) {
+						fifo.format = new AudioFormat(freq, 16, channels, true,
+								false);
 					}
-					
-					while (fifo.write(buff, readLen) == -1) {
-						try {
-							Thread.sleep(50);
-						} catch (InterruptedException e) {
-							// TODO Auto-generated catch block
-							e.printStackTrace();
-						}
-					}
-					count += readLen;
-				} catch (IOException e1) {
+
+					output = new RamObuffer(channels, freq, fifo);
+					decoder.setOutputBuffer(output);
+
+					decoder.decodeFrame(header, bitIn);
+
+					bitIn.closeFrame();
+				} catch (BitstreamException e) {
 					// TODO Auto-generated catch block
-					e1.printStackTrace();
+					e.printStackTrace();
+				} catch (DecoderException e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
 				}
-			}		
+			}
+
 		}
 	}
 
@@ -186,8 +262,8 @@ class HttpFile {
 		int contenSize;
 		contenSize = Integer.valueOf(getHeadInfo("Content-Length"));
 
-		fifo = new Fifo(contenSize / 10);
-		DownloadThread download = new DownloadThread(fifo, contenSize);
+		fifo = new Fifo(contenSize * 10);
+		DownloadThread download = new DownloadThread(fifo);
 		download.start();
 	}
 
@@ -235,35 +311,45 @@ class WavPlayer {
 	private Fifo fifo;
 
 	public WavPlayer(Fifo wavFifo) {
-		byte[] buff = new byte[512];
+		// byte[] buff = new byte[512];
 		fifo = wavFifo;
-		
-		while (-1 == fifo.read(buff, buff.length)) {
+		//
+		// while (-1 == fifo.read(buff, buff.length)) {
+		// try {
+		// Thread.sleep(100);
+		// } catch (InterruptedException e) {
+		// // TODO Auto-generated catch block
+		// e.printStackTrace();
+		// }
+		// }
+		//
+		// ByteArrayInputStream in = new ByteArrayInputStream(buff);
+		//
+		// try {
+		// format = AudioSystem.getAudioFileFormat(in).getFormat();
+		// } catch (UnsupportedAudioFileException e1) {
+		// // TODO Auto-generated catch block
+		// e1.printStackTrace();
+		// } catch (IOException e1) {
+		// // TODO Auto-generated catch block
+		// e1.printStackTrace();
+		// }
+		while (fifo.format == null) {
 			try {
 				Thread.sleep(100);
-			} catch (InterruptedException e) {
+			} catch (InterruptedException e1) {
 				// TODO Auto-generated catch block
-				e.printStackTrace();
+				e1.printStackTrace();
 			}
 		}
 
-		ByteArrayInputStream in = new ByteArrayInputStream(buff);
-		
-		try {
-			format = AudioSystem.getAudioFileFormat(in).getFormat();
-		} catch (UnsupportedAudioFileException e1) {
-			// TODO Auto-generated catch block
-			System.out.println("aff");
-			e1.printStackTrace();
-		} catch (IOException e1) {
-			// TODO Auto-generated catch block
-			e1.printStackTrace();
-		}
-	
+		format = fifo.format;
+
 		bufferSize = format.getFrameSize()
-				* Math.round(((AudioFormat) format).getSampleRate() / 10);
+				* Math.round(format.getSampleRate() / 10);
+
 		DataLine.Info info = new DataLine.Info(SourceDataLine.class, format);
-		
+
 		try {
 			line = (SourceDataLine) AudioSystem.getLine(info);
 			line.open(format, bufferSize);
@@ -291,6 +377,8 @@ class WavPlayer {
 				continue;
 			}
 
+			System.out.println("read len: " + readLen);
+
 			line.write(lineBuff, 0, bufferSize);
 		}
 	}
@@ -317,8 +405,8 @@ public class Splayer {
 	}
 
 	public static void main(String[] args) {
-		Splayer player = new Splayer("file:///wind.mp3");
-//		Splayer player = new Splayer("http://192.168.1.130/huanyin.wav");
+		// Splayer player = new Splayer("file:///wind.mp3");
+		Splayer player = new Splayer("http://192.168.1.130/xyt.mp3");
 		player.play();
 	}
 }
